@@ -320,11 +320,23 @@ function calcInvestment() {
     });
 }
 
-// ------------------------------------------------------------------
-// 5. AUDITORÍA REAL (TWR / MWR)
-// ------------------------------------------------------------------
+/* --- PARTE AUDITORÍA (MWR/TWR)*/
+
+function triggerAuditUpload() {
+    // Validar que haya valor actual primero
+    const finalVal = parseFloat(document.getElementById('auditFinalValue').value);
+    if (isNaN(finalVal)) {
+        alert("Por favor ingresa primero el Valor Actual de la Cartera (cuánto tienes hoy).");
+        return;
+    }
+    document.getElementById('fileInput').click();
+}
+
 document.getElementById('fileInput').addEventListener('change', (evt) => {
-    const file = evt.target.files[0]; if (!file) return;
+    const file = evt.target.files[0];
+    if (!file) return;
+    document.getElementById('auditFileName').innerText = file.name;
+    
     const reader = new FileReader();
     reader.onload = (e) => {
         const data = new Uint8Array(e.target.result);
@@ -336,65 +348,174 @@ document.getElementById('fileInput').addEventListener('change', (evt) => {
 });
 
 function processPortfolioData(rows) {
-    const rawData = rows.filter(r => r.length >= 3 && !isNaN(parseDateExcel(r[0]).getTime()));
-    const transactions = rawData.map(r => ({ date: parseDateExcel(r[0]), flow: parseFloat(r[1]) || 0, balance: parseFloat(r[2]) || 0 })).sort((a,b) => a.date - b.date);
+    // 1. Obtener Valor Final Manual
+    const manualFinalValue = parseFloat(document.getElementById('auditFinalValue').value);
 
-    if (transactions.length < 2) return alert("Faltan datos en el Excel.");
+    // 2. Limpiar Datos del Excel
+    const rawData = rows.filter(r => r.length >= 2 && !isNaN(parseDateExcel(r[0]).getTime()));
+    
+    // Mapear columnas: A=Fecha, B=Flujo (Aporte/Retiro)
+    // NOTA: Para TWR necesitamos el Saldo también (Columna C), pero para MWR solo necesitamos Fecha y Flujo.
+    const transactions = rawData.map(r => ({
+        date: parseDateExcel(r[0]),
+        flow: parseFloat(r[1]) || 0,
+        balance: parseFloat(r[2]) || 0 // Necesario para TWR
+    })).sort((a,b) => a.date - b.date);
 
-    const twr = calculateTWR(transactions);
-    const mwr = calculateXIRR(transactions);
-    const profit = transactions[transactions.length-1].balance - transactions.reduce((s, t) => s + t.flow, 0);
+    if (transactions.length === 0) return alert("El archivo está vacío o tiene formato incorrecto.");
 
-    document.getElementById('val-twr').innerText = (twr * 100).toFixed(2) + "%";
+    // 3. Cálculos
+    const mwr = calculateMWR(transactions, manualFinalValue);
+    const twr = calculateTWR(transactions, manualFinalValue);
+    
+    // Ganancia = Valor Final - (Suma de todos los aportes netos)
+    const totalInvested = transactions.reduce((acc, t) => acc + t.flow, 0);
+    const profit = manualFinalValue - totalInvested;
+
+    // 4. Mostrar Resultados
     document.getElementById('val-mwr').innerText = (mwr * 100).toFixed(2) + "%";
-    document.getElementById('val-profit').innerText = formatMoney(profit);
-    document.getElementById('val-profit').className = `display-6 fw-bold mt-2 ${profit >= 0 ? 'text-success' : 'text-danger'}`;
+    document.getElementById('val-twr').innerText = (twr * 100).toFixed(2) + "%";
+    
+    const elProfit = document.getElementById('val-profit');
+    elProfit.innerText = formatMoney(profit);
+    elProfit.className = profit >= 0 ? "text-success fw-bold mb-0" : "text-danger fw-bold mb-0";
 
+    // 5. Graficar
+    renderAuditChart(transactions, manualFinalValue);
+    
+    document.getElementById('audit-placeholder').classList.add('d-none');
+    document.getElementById('audit-results').classList.remove('d-none');
+}
+
+// MWR (Money Weighted Return) = XIRR
+function calculateMWR(transactions, finalValue) {
+    // Preparamos los flujos para XIRR
+    // Regla: Aportes son negativos (salen de tu bolsillo), Valor Final es positivo (entra a tu bolsillo)
+    let cashflows = transactions.map(t => ({
+        amount: -t.flow, // Invertimos signo: Aporte (positivo en excel) -> Negativo para XIRR
+        date: t.date
+    }));
+
+    // Agregamos el Valor Actual como si vendiéramos todo HOY
+    cashflows.push({
+        amount: finalValue,
+        date: new Date() // Fecha de hoy
+    });
+
+    return xirr(cashflows);
+}
+
+// Algoritmo XIRR (Newton-Raphson)
+function xirr(cfs, guess = 0.1) {
+    let x0 = guess;
+    const t0 = cfs[0].date;
+    
+    for (let i = 0; i < 100; i++) {
+        let f = 0, df = 0;
+        for (let c of cfs) {
+            const dt = (c.date - t0) / 86400000 / 365; // Años
+            const term = Math.pow(1 + x0, dt);
+            f += c.amount / term;
+            df -= (c.amount * dt) / (term * (1 + x0));
+        }
+        const x1 = x0 - f / df;
+        if (Math.abs(x1 - x0) < 1e-6) return x1;
+        x0 = x1;
+    }
+    return x0;
+}
+
+// TWR (Time Weighted Return)
+function calculateTWR(transactions, finalValue) {
+    let growthFactor = 1.0;
+    
+    for (let i = 0; i < transactions.length; i++) {
+        // En TWR necesitamos saber el valor del portafolio justo ANTES del siguiente flujo
+        // Si el Excel no tiene saldos diarios, el TWR es difícil de calcular exacto.
+        // Aquí usaremos la columna "Saldo" del Excel asumiendo que es el valor MARK-TO-MARKET.
+        
+        let startVal, endVal, flow;
+        
+        if (i === 0) {
+            startVal = transactions[i].flow; // Primer aporte
+            continue; 
+        } else {
+            // El periodo va desde la transacción anterior hasta la actual
+            const prev = transactions[i-1];
+            const curr = transactions[i];
+            
+            // Valor al inicio del sub-periodo (después del flujo anterior)
+            startVal = prev.balance; 
+            
+            // Valor al final del sub-periodo (antes del flujo actual)
+            // Aquí hay un truco: El Excel suele traer "Saldo Final". 
+            // Asumiremos: SaldoReportado = ValorMercado + FlujoNuevo
+            // Entonces ValorMercado = SaldoReportado - FlujoNuevo
+            endVal = curr.balance - curr.flow; 
+            
+            if (startVal > 0) {
+                const hpr = (endVal - startVal) / startVal;
+                growthFactor *= (1 + hpr);
+            }
+        }
+    }
+    
+    // Último tramo: Desde el último registro hasta HOY (Valor Actual Manual)
+    const last = transactions[transactions.length - 1];
+    if (last.balance > 0) {
+        const lastHPR = (finalValue - last.balance) / last.balance;
+        growthFactor *= (1 + lastHPR);
+    }
+
+    return growthFactor - 1;
+}
+
+function renderAuditChart(data, finalVal) {
     const ctx = document.getElementById('auditChart').getContext('2d');
     if (auditChart) auditChart.destroy();
-    let costs = [], run = 0; transactions.forEach(d => { run += d.flow; costs.push(run); });
-    
+
+    // Costo Acumulado (Tu dinero invertido)
+    let cost = [];
+    let accum = 0;
+    data.forEach(t => {
+        accum += t.flow;
+        cost.push(accum);
+    });
+    // Agregar punto final hoy
+    cost.push(accum);
+
+    // Valor de Mercado
+    let market = data.map(t => t.balance);
+    market.push(finalVal); // Punto final hoy
+
+    let labels = data.map(t => parseDateExcel(t.date).toLocaleDateString());
+    labels.push("HOY");
+
     auditChart = new Chart(ctx, {
         type: 'line',
         data: {
-            labels: transactions.map(d => d.date.toLocaleDateString()),
+            labels: labels,
             datasets: [
-                { label: 'Valor Cartera', data: transactions.map(d => d.balance), borderColor: '#10b981', fill: true, backgroundColor: 'rgba(16, 185, 129, 0.1)' },
-                { label: 'Costo Neto', data: costs, borderColor: '#333', borderDash: [5,5], fill: false }
+                {
+                    label: 'Valor Cartera (Patrimonio)',
+                    data: market,
+                    borderColor: '#10b981', // Verde
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    fill: true,
+                    tension: 0.3
+                },
+                {
+                    label: 'Costo Neto (Tu Bolsillo)',
+                    data: cost,
+                    borderColor: '#374151', // Gris oscuro
+                    borderDash: [5, 5],
+                    fill: false,
+                    tension: 0
+                }
             ]
         },
         options: { responsive: true, maintainAspectRatio: false }
     });
-    document.getElementById('upload-area').classList.add('d-none');
-    document.getElementById('results-area').classList.remove('d-none');
-}
-
-function calculateTWR(data) {
-    let g = 1.0;
-    for (let i = 1; i < data.length; i++) {
-        const start = data[i-1].balance;
-        const end = data[i].balance - data[i].flow;
-        if (start > 0) g *= (1 + (end - start) / start);
-    }
-    return g - 1;
-}
-
-function calculateXIRR(data) {
-    let x0 = 0.1; const t0 = data[0].date;
-    const cfs = data.map(d => ({ v: -d.flow, d: (d.date-t0)/86400000 }));
-    cfs.push({ v: data[data.length-1].balance, d: (data[data.length-1].date-t0)/86400000 });
-    for(let i=0; i<100; i++) {
-        let fv=0, fd=0;
-        for(const c of cfs) {
-            if(c.v === 0) continue;
-            const f = Math.pow(1+x0, c.d/365);
-            fv += c.v/f; fd += -c.v*(c.d/365)/(f*(1+x0));
-        }
-        const x1 = x0 - fv/fd;
-        if(Math.abs(x1-x0)<1e-6) return x1;
-        x0 = x1;
-    }
-    return x0;
 }
 
 // --- UTILS ---
